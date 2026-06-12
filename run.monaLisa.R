@@ -106,5 +106,4 @@ pdf(output_pdf_name, width = 10, height = 15)
                     width.seqlogo = 1.2)
   
   dev.off()
-  message("SUCCESSFULLY COMPLETED: ", output_pdf_name)
 }
