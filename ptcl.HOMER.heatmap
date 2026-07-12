@@ -1,1 +1,166 @@
+library(data.table)
+library(ComplexHeatmap)
+library(circlize)
+library(RColorBrewer)
 
+#Step 1: Defined paths
+files <- c(
+  ALK_neg_ALCL = "C:/Users/Public/ALK_neg_ALCL_vs_CD4_se_ATAC_count_HOMER_TF/ALK_neg_knownResults.txt",
+  ALK_pos_ALCL = "C:/Users/Public/ALK_pos_ALCL_vs_CD4_se_ATAC_count_HOMER_TF/ALK_pos_knownResults.txt",
+  ANKL         = "C:/Users/Public/ANKL_vs_NK_se_ATAC_count_HOMER_TF/ANKL_knownResults.txt",
+  ATLL         = "C:/Users/Public/ATLL_vs_CD4_se_ATAC_count_HOMER_TF/ATLL_knownResults.txt",
+  BIA_ALCL     = "C:/Users/Public/BIA_ALCL_vs_CD4_se_ATAC_count_HOMER_TF/BIA_knownResults.txt",
+  CTCL         = "C:/Users/Public/CTCL_vs_CD4_se_ATAC_count_HOMER_TF/CTCL_knownResults.txt",
+  ENKTL        = "C:/Users/Public/ENKTL_vs_NK_se_ATAC_count_HOMER_TF/ENKTL_knownResults.txt",
+  nTFHL        = "C:/Users/Public/nTFHL_vs_TFH_se_ATAC_count_HOMER_TF/nTFHL_knownResults.txt",
+  "PTCL-NOS"   = "C:/Users/Public/PTCL-NOS_vs_CD4_se_ATAC_count_HOMER_TF/PTCL-NOS_knownResults.txt",  # fill in - was missing
+  "T-PLL"      = "C:/Users/Public/T-PLL_vs_TcmCD4_se_ATAC_count_HOMER_TF/TPLL_knownResults.txt"
+)
+
+#Helper function: Convert character tags to logical binary metrics
+parse_binary_hits <- function(x) {
+  as.integer(x != "" & !is.na(x))
+}
+
+#Step 2: Extract - now returns the FULL motif table (no top_n truncation here;
+# truncation happens later, after all subtypes are loaded, so row sets can be
+# unioned consistently across subtypes)
+process_subtype_to_model <- function(file_path, subtype_name) {
+  if (!file.exists(file_path)) {
+    cat("  Warning: File path does not exist for", subtype_name, "- Skipping.\n")
+    return(NULL)
+  }
+
+  df <- fread(file_path, header = TRUE, sep = "\t")
+  total_peaks <- nrow(df)
+
+  motif_cols <- grep("Distance From Peak", colnames(df), value = TRUE)
+  if (length(motif_cols) == 0) {
+    cat("  Warning: No motif columns found for", subtype_name, "- Skipping.\n")
+    return(NULL)
+  }
+  cat("Found", length(motif_cols), "motifs across", total_peaks, "peaks for", subtype_name, "\n")
+
+  motif_mat <- sapply(df[, ..motif_cols], parse_binary_hits)
+  motif_mat <- as.matrix(motif_mat)
+
+  clean_names <- gsub("Distance From Peak.*", "", motif_cols)
+  clean_names <- gsub('[\r\n]', "", clean_names)
+  clean_names <- gsub('"', "", clean_names)
+  clean_names <- trimws(clean_names)
+  colnames(motif_mat) <- clean_names
+
+  peaks_with_motif <- colSums(motif_mat)
+  hit_rate <- peaks_with_motif / total_peaks
+  bg_rate <- 0.05
+
+  log2_enrichment <- log2((hit_rate + 0.001) / (bg_rate + 0.001))
+
+  p_values <- sapply(seq_along(peaks_with_motif), function(i) {
+    res <- binom.test(x = peaks_with_motif[i], n = total_peaks, p = bg_rate, alternative = "greater")
+    res$p.value
+  })
+  neglog10p <- -log10(p_values)
+  neglog10p[is.na(neglog10p) | is.infinite(neglog10p)] <- 300
+
+  mat <- cbind(log2Enrichment = log2_enrichment, NegLog10P = neglog10p)
+  rownames(mat) <- colnames(motif_mat)
+  mat <- mat[order(mat[, "NegLog10P"], decreasing = TRUE), , drop = FALSE]
+  mat
+}
+
+#Step 3: Loop over every subtype, collect full per-subtype matrices
+top_n_per_subtype <- 15  # how many top motifs each subtype contributes to the combined row set
+all_mats <- list()
+
+for (subtype in names(files)) {
+  mat <- process_subtype_to_model(files[[subtype]], subtype)
+  if (is.null(mat)) next
+  all_mats[[subtype]] <- mat
+}
+
+if (length(all_mats) == 0) stop("No subtype files loaded successfully - check paths in `files`.")
+
+#Step 4: Build the combined TF x Subtype matrix
+# Row set = union of each subtype's top-N most significant motifs
+sig_tfs <- unique(unlist(lapply(all_mats, function(m) {
+  head(rownames(m), top_n_per_subtype)
+})))
+
+combined_log2enr <- matrix(NA_real_, nrow = length(sig_tfs), ncol = length(all_mats),
+                            dimnames = list(sig_tfs, names(all_mats)))
+combined_neglog10p <- combined_log2enr
+
+for (subtype in names(all_mats)) {
+  m <- all_mats[[subtype]]
+  common <- intersect(sig_tfs, rownames(m))
+  combined_log2enr[common, subtype]   <- m[common, "log2Enrichment"]
+  combined_neglog10p[common, subtype] <- m[common, "NegLog10P"]
+}
+
+# Motifs a subtype's own file didn't reach significance for: treat as 0
+# enrichment rather than leaving NA (NA would break clustering/scaling).
+combined_log2enr[is.na(combined_log2enr)] <- 0
+combined_neglog10p[is.na(combined_neglog10p)] <- 0
+
+#Step 5: TF family grouping (same categorization used in your other heatmaps,
+# for visual/row-order consistency across figures)
+clean_tf <- sub("\\(.*", "", sig_tfs)  # strip "(bZIP)" etc. suffixes for matching
+tf_groups <- rep("Other", length(sig_tfs))
+names(tf_groups) <- sig_tfs
+tf_groups[grepl("JUN|FOS|BATF|JDP2|Atf3", clean_tf, ignore.case = TRUE)] <- "AP-1 (FOS/JUN/ATF/BATF)"
+tf_groups[grepl("MAF|BACH|NFE2", clean_tf, ignore.case = TRUE)]         <- "bZIP MAF/NRF2/BACH"
+tf_groups[grepl("REL|NFKB", clean_tf, ignore.case = TRUE)]              <- "NF-kB"
+tf_groups[grepl("STAT|IRF", clean_tf, ignore.case = TRUE)]              <- "JAK-STAT"
+tf_groups[grepl("CEBP|ROR|TP53|BCL11|NR2|Nr1|HOX", clean_tf, ignore.case = TRUE)] <- "Nuclear receptor/CEBP"
+tf_groups[grepl("MYC|MAX|SNAI|ZEB|TCF|Ptf1A|FIGLA|TEAD|MNT|Mlxip|Arnt", clean_tf, ignore.case = TRUE)] <- "bHLH/MYC/EMT"
+tf_groups[grepl("GATA|TRPS1", clean_tf, ignore.case = TRUE)]            <- "GATA"
+tf_groups[grepl("CTCF", clean_tf, ignore.case = TRUE)]                  <- "CTCF/insulator"
+tf_groups[grepl("KLF|SP|ZNF148|ZNF281", clean_tf, ignore.case = TRUE)]  <- "KLF/SP"
+tf_groups[grepl("RFX|ZNF175|ZNF384|ZNF362|ZFP28|Hnf1A|NFATC", clean_tf, ignore.case = TRUE)] <- "RFX / Zinc Finger"
+tf_groups[grepl("RUNX|TBR|TBX|EOMES", clean_tf, ignore.case = TRUE)]    <- "RUNX/CBF & T-box"
+tf_groups[grepl("ETS|ETV|EHF|ELF|ELK|GABPA|ZBTB11|ERF|Erg", clean_tf, ignore.case = TRUE)] <- "ETS family"
+tf_groups[grepl("FOX|IKZF|Spi1|SPIB", clean_tf, ignore.case = TRUE)]    <- "Forkhead / Lymphoid ZF"
+
+#Step 6: Scale rows (z-score across subtypes) for the color scale
+mat_scaled <- t(scale(t(combined_log2enr)))
+mat_scaled[is.na(mat_scaled)] <- 0
+mat_scaled[mat_scaled >  3] <-  3
+mat_scaled[mat_scaled < -3] <- -3
+
+#Step 7: Column annotation - just Subtype here, since this file set has no
+# real per-sample Normal reference (bg_rate is a fixed constant, not data)
+col_subtype <- setNames(
+  colorRampPalette(brewer.pal(9, "Set1"))(length(colnames(mat_scaled))),
+  colnames(mat_scaled)
+)
+top_ann <- HeatmapAnnotation(
+  Subtype = colnames(mat_scaled),
+  col = list(Subtype = col_subtype),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 8, fontface = "bold")
+)
+
+#Step 8: Combined heatmap
+ht <- Heatmap(
+  mat_scaled,
+  name = "log2 enrich\n(z-scored)",
+  col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")),
+  top_annotation = top_ann,
+  cluster_columns = TRUE,
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 10, fontface = "bold"),
+  row_split = factor(tf_groups),
+  cluster_rows = TRUE,
+  row_title_rot = 0,
+  row_names_gp = gpar(fontsize = 7),
+  row_title_gp = gpar(fontsize = 8, fontface = "bold"),
+  border = TRUE,
+  row_gap = unit(1, "mm")
+)
+
+pdf("combined_HOMER_motif_heatmap.pdf", width = 10, height = 14)
+draw(ht, annotation_legend_side = "right", heatmap_legend_side = "right")
+dev.off()
+
+message("Saved: combined_HOMER_motif_heatmap.pdf  (", length(all_mats), " of ", length(files), " subtypes loaded)")
